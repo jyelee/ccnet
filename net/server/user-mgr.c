@@ -33,6 +33,7 @@
 
 #define DEFAULT_SAVING_INTERVAL_MSEC 30000
 
+#define LDAP_USERS_CACHE_EXPIRE 3600
 
 G_DEFINE_TYPE (CcnetUserManager, ccnet_user_manager, G_TYPE_OBJECT);
 
@@ -51,6 +52,10 @@ struct CcnetUserManagerPriv {
     CcnetDB    *db;
     int         max_users;
     int         cur_users;
+#ifdef HAVE_LDAP
+    GList      *ldap_users_cache;
+    gint64      cache_expire_time;
+#endif
 };
 
 
@@ -321,19 +326,67 @@ out:
     return ret;
 }
 
+static GList *
+get_cached_user_list (GList *cache, int start, int limit)
+{
+    int i;
+    GList *ret = NULL, *ptr;
+    char *email;
+    CcnetEmailUser *user;
+
+    if (start == -1)
+        start = 0;
+    for (i = 0, ptr = cache; ptr; ++i, ptr = ptr->next) {
+        if (i < start)
+            continue;
+        if (limit >= 0 && i >= start + limit)
+            break;
+
+        email = ptr->data;
+        user = g_object_new (CCNET_TYPE_EMAIL_USER,
+                             "id", 0,
+                             "email", email,
+                             "is_staff", FALSE,
+                             "is_active", TRUE,
+                             "ctime", (gint64)0,
+                             "source", "LDAP",
+                             NULL);
+        ret = g_list_prepend (ret, user);
+    }
+
+    return ret;
+}
+
+inline static int cmp_usernames (gpointer a, gpointer b)
+{
+    char *a_str = a, *b_str = b;
+
+    return strcmp (a_str, b_str);
+}
+
 /*
  * @uid: user's uid, list all users if * is passed in.
  */
 static GList *ldap_list_users (CcnetUserManager *manager, const char *uid,
                                int start, int limit)
 {
+    CcnetUserManagerPriv *priv = manager->priv;
     LDAP *ld = NULL;
+    GList *cache = NULL;
     GList *ret = NULL;
     int res;
     GString *filter;
     char *filter_str;
     char *attrs[2];
     LDAPMessage *msg = NULL, *entry;
+
+    if (strcmp (uid, "*") == 0) {
+        gint64 now = (gint64)time(NULL);
+        if (priv->ldap_users_cache && priv->cache_expire_time > now) {
+            ret = get_cached_user_list (priv->ldap_users_cache, start, limit);
+            return ret;
+        }
+    }
 
     ld = ldap_init_and_bind (manager->ldap_host,
 #ifdef WIN32
@@ -355,10 +408,7 @@ static GList *ldap_list_users (CcnetUserManager *manager, const char *uid,
     attrs[0] = manager->login_attr;
     attrs[1] = NULL;
 
-    int i = 0;
-    if (start == -1)
-        start = 0;
-
+    int i;
     char **base;
     for (base = manager->base_list; *base; ++base) {
         res = ldap_search_s (ld, *base, LDAP_SCOPE_SUBTREE,
@@ -367,6 +417,7 @@ static GList *ldap_list_users (CcnetUserManager *manager, const char *uid,
             ccnet_warning ("ldap_search failed: %s.\n", ldap_err2string(res));
             ret = NULL;
             ldap_msgfree (msg);
+            string_list_free (cache);
             goto out;
         }
 
@@ -376,29 +427,12 @@ static GList *ldap_list_users (CcnetUserManager *manager, const char *uid,
             char *attr;
             char **vals;
             BerElement *ber;
-            CcnetEmailUser *user;
-
-            if (i < start)
-                continue;
-            if (limit >= 0 && i >= start + limit) {
-                ldap_msgfree (msg);
-                goto out;
-            }
 
             attr = ldap_first_attribute (ld, entry, &ber);
             vals = ldap_get_values (ld, entry, attr);
 
             char *email_l = g_ascii_strdown (vals[0], -1);
-            user = g_object_new (CCNET_TYPE_EMAIL_USER,
-                                 "id", 0,
-                                 "email", email_l,
-                                 "is_staff", FALSE,
-                                 "is_active", TRUE,
-                                 "ctime", (gint64)0,
-                                 "source", "LDAP",
-                                 NULL);
-            g_free (email_l);
-            ret = g_list_prepend (ret, user);
+            cache = g_list_prepend (cache, email_l);
 
             ldap_memfree (attr);
             ldap_value_free (vals);
@@ -406,6 +440,20 @@ static GList *ldap_list_users (CcnetUserManager *manager, const char *uid,
         }
 
         ldap_msgfree (msg);
+    }
+
+    cache = g_list_sort (cache, cmp_usernames);
+
+    ret = get_cached_user_list (cache, start, limit);
+
+    if (strcmp (uid, "*") == 0) {
+        /* Update cache */
+        string_list_free (priv->ldap_users_cache);
+        priv->ldap_users_cache = cache;
+        gint64 now = (gint64)time(NULL);
+        priv->cache_expire_time = now + LDAP_USERS_CACHE_EXPIRE;
+    } else {
+        string_list_free (cache);
     }
 
 out:
@@ -424,7 +472,15 @@ static int ldap_count_users (CcnetUserManager *manager, const char *uid)
     GString *filter;
     char *filter_str;
     char *attrs[2];
-    LDAPMessage *msg = NULL;
+    LDAPMessage *msg = NULL, *entry;
+    int count = 0;
+    GList *cache = NULL;
+
+    gint64 now = (gint64)time(NULL);
+    if (priv->ldap_users_cache && priv->cache_expire_time > now) {
+        count = g_list_length (priv->ldap_users_cache);
+        return count;
+    }
 
     ld = ldap_init_and_bind (manager->ldap_host,
 #ifdef WIN32
@@ -447,7 +503,6 @@ static int ldap_count_users (CcnetUserManager *manager, const char *uid)
     attrs[1] = NULL;
 
     char **base;
-    int count = 0;
     for (base = manager->base_list; *base; ++base) {
         res = ldap_search_s (ld, *base, LDAP_SCOPE_SUBTREE,
                              filter_str, attrs, 0, &msg);
@@ -459,8 +514,35 @@ static int ldap_count_users (CcnetUserManager *manager, const char *uid)
         }
 
         count += ldap_count_entries (ld, msg);
+
+        for (entry = ldap_first_entry (ld, msg);
+             entry != NULL;
+             entry = ldap_next_entry (ld, entry), ++i) {
+            char *attr;
+            char **vals;
+            BerElement *ber;
+
+            attr = ldap_first_attribute (ld, entry, &ber);
+            vals = ldap_get_values (ld, entry, attr);
+
+            char *email_l = g_ascii_strdown (vals[0], -1);
+            cache = g_list_prepend (cache, email_l);
+
+            ldap_memfree (attr);
+            ldap_value_free (vals);
+            ber_free (ber, 0);
+        }
+
         ldap_msgfree (msg);
     }
+
+    cache = g_list_sort (cache, cmp_usernames);
+
+    /* Update cache */
+    string_list_free (priv->ldap_users_cache);
+    priv->ldap_users_cache = cache;
+    now = (gint64)time(NULL);
+    priv->cache_expire_time = now + LDAP_USERS_CACHE_EXPIRE;
 
 out:
     g_free (filter_str);
